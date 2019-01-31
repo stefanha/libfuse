@@ -60,6 +60,7 @@ struct lo_map_elem {
 	union {
 		struct lo_inode *inode;
 		struct lo_dirp *dirp;
+		int fd;
 		ssize_t freelist;
 	};
 	bool in_use;
@@ -102,6 +103,7 @@ struct lo_data {
 	struct lo_inode root; /* protected by lo->mutex */
 	struct lo_map ino_map; /* protected by lo->mutex */
 	struct lo_map dirp_map; /* protected by lo->mutex */
+	struct lo_map fd_map; /* protected by lo->mutex */
 };
 
 static const struct fuse_opt lo_opts[] = {
@@ -237,6 +239,19 @@ static void lo_map_remove(struct lo_map *map, size_t key)
 }
 
 /* Assumes lo->mutex is held */
+static ssize_t lo_add_fd_mapping(fuse_req_t req, int fd)
+{
+	struct lo_map_elem *elem;
+
+	elem = lo_map_alloc_elem(&lo_data(req)->fd_map);
+	if (!elem)
+		return -1;
+
+	elem->fd = fd;
+	return elem - lo_data(req)->fd_map.elems;
+}
+
+/* Assumes lo->mutex is held */
 static ssize_t lo_add_dirp_mapping(fuse_req_t req, struct lo_dirp *dirp)
 {
 	struct lo_map_elem *elem;
@@ -345,6 +360,21 @@ static int utimensat_empty_nofollow(struct lo_inode *inode,
 	return utimensat(AT_FDCWD, procname, tv, 0);
 }
 
+static int lo_fi_fd(fuse_req_t req, struct fuse_file_info *fi)
+{
+	struct lo_data *lo = lo_data(req);
+	struct lo_map_elem *elem;
+
+	pthread_mutex_lock(&lo->mutex);
+	elem = lo_map_get(&lo->fd_map, fi->fh);
+	pthread_mutex_unlock(&lo->mutex);
+
+	if (!elem)
+		return -1;
+
+	return elem->fd;
+}
+
 static void lo_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 		       int valid, struct fuse_file_info *fi)
 {
@@ -353,6 +383,7 @@ static void lo_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 	struct lo_inode *inode;
 	int ifd;
 	int res;
+	int fd;
 
 	inode = lo_inode(req, ino);
 	if (!inode) {
@@ -362,9 +393,13 @@ static void lo_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 
 	ifd = inode->fd;
 
+	/* If fi->fh is invalid we'll report EBADF later */
+	if (fi)
+		fd = lo_fi_fd(req, fi);
+
 	if (valid & FUSE_SET_ATTR_MODE) {
 		if (fi) {
-			res = fchmod(fi->fh, attr->st_mode);
+			res = fchmod(fd, attr->st_mode);
 		} else {
 			sprintf(procname, "/proc/self/fd/%i", ifd);
 			res = chmod(procname, attr->st_mode);
@@ -385,7 +420,7 @@ static void lo_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 	}
 	if (valid & FUSE_SET_ATTR_SIZE) {
 		if (fi) {
-			res = ftruncate(fi->fh, attr->st_size);
+			res = ftruncate(fd, attr->st_size);
 		} else {
 			sprintf(procname, "/proc/self/fd/%i", ifd);
 			res = truncate(procname, attr->st_size);
@@ -412,7 +447,7 @@ static void lo_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 			tv[1] = attr->st_mtim;
 
 		if (fi)
-			res = futimens(fi->fh, tv);
+			res = futimens(fd, tv);
 		else
 			res = utimensat_empty_nofollow(inode, tv);
 		if (res == -1)
@@ -969,6 +1004,7 @@ static void lo_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 		      mode_t mode, struct fuse_file_info *fi)
 {
 	int fd;
+	ssize_t fh;
 	struct fuse_entry_param e;
 	int err;
 
@@ -981,7 +1017,14 @@ static void lo_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 	if (fd == -1)
 		return (void) fuse_reply_err(req, errno);
 
-	fi->fh = fd;
+	fh = lo_add_fd_mapping(req, fd);
+	if (fh == -1) {
+		close(fd);
+		fuse_reply_err(req, ENOMEM);
+		return;
+	}
+
+	fi->fh = fh;
 
 	err = lo_do_lookup(req, parent, name, &e);
 	if (err)
@@ -1016,6 +1059,7 @@ static void lo_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync,
 static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
 	int fd;
+	ssize_t fh;
 	char buf[64];
 	struct lo_data *lo = lo_data(req);
 
@@ -1044,7 +1088,14 @@ static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 	if (fd == -1)
 		return (void) fuse_reply_err(req, errno);
 
-	fi->fh = fd;
+	fh = lo_add_fd_mapping(req, fd);
+	if (fh == -1) {
+		close(fd);
+		fuse_reply_err(req, ENOMEM);
+		return;
+	}
+
+	fi->fh = fh;
 	if (lo->cache == CACHE_NEVER)
 		fi->direct_io = 1;
 	else if (lo->cache == CACHE_ALWAYS)
@@ -1054,9 +1105,18 @@ static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 
 static void lo_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
+	struct lo_data *lo = lo_data(req);
+	int fd;
+
 	(void) ino;
 
-	close(fi->fh);
+	fd = lo_fi_fd(req, fi);
+
+	pthread_mutex_lock(&lo->mutex);
+	lo_map_remove(&lo->fd_map, fi->fh);
+	pthread_mutex_unlock(&lo->mutex);
+
+	close(fd);
 	fuse_reply_err(req, 0);
 }
 
@@ -1064,19 +1124,24 @@ static void lo_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
 	int res;
 	(void) ino;
-	res = close(dup(fi->fh));
+	res = close(dup(lo_fi_fd(req, fi)));
 	fuse_reply_err(req, res == -1 ? errno : 0);
 }
 
 static void lo_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
 		     struct fuse_file_info *fi)
 {
+	int fd;
 	int res;
+
 	(void) ino;
+
+	fd = lo_fi_fd(req, fi);
+
 	if (datasync)
-		res = fdatasync(fi->fh);
+		res = fdatasync(fd);
 	else
-		res = fsync(fi->fh);
+		res = fsync(fd);
 	fuse_reply_err(req, res == -1 ? errno : 0);
 }
 
@@ -1090,7 +1155,7 @@ static void lo_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 			"off=%lu)\n", ino, size, (unsigned long) offset);
 
 	buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
-	buf.buf[0].fd = fi->fh;
+	buf.buf[0].fd = lo_fi_fd(req, fi);
 	buf.buf[0].pos = offset;
 
 	fuse_reply_data(req, &buf, FUSE_BUF_SPLICE_MOVE);
@@ -1105,7 +1170,7 @@ static void lo_write_buf(fuse_req_t req, fuse_ino_t ino,
 	struct fuse_bufvec out_buf = FUSE_BUFVEC_INIT(fuse_buf_size(in_buf));
 
 	out_buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
-	out_buf.buf[0].fd = fi->fh;
+	out_buf.buf[0].fd = lo_fi_fd(req, fi);
 	out_buf.buf[0].pos = off;
 
 	if (lo_debug(req))
@@ -1142,7 +1207,8 @@ static void lo_fallocate(fuse_req_t req, fuse_ino_t ino, int mode,
 		return;
 	}
 
-	err = posix_fallocate(fi->fh, offset, length);
+	err = posix_fallocate(lo_fi_fd(req, fi), offset,
+			      length);
 
 	fuse_reply_err(req, err);
 }
@@ -1153,7 +1219,7 @@ static void lo_flock(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi,
 	int res;
 	(void) ino;
 
-	res = flock(fi->fh, op);
+	res = flock(lo_fi_fd(req, fi), op);
 
 	fuse_reply_err(req, res == -1 ? errno : 0);
 }
@@ -1365,17 +1431,20 @@ static void lo_copy_file_range(fuse_req_t req, fuse_ino_t ino_in, off_t off_in,
 			       struct fuse_file_info *fi_out, size_t len,
 			       int flags)
 {
+	int in_fd, out_fd;
 	ssize_t res;
 
-	if (lo_debug(req))
-		fprintf(stderr, "lo_copy_file_range(ino=%" PRIu64 "/fd=%lu, "
-				"off=%lu, ino=%" PRIu64 "/fd=%lu, "
-				"off=%lu, size=%zd, flags=0x%x)\n",
-			ino_in, fi_in->fh, off_in, ino_out, fi_out->fh, off_out,
-			len, flags);
+	in_fd = lo_fi_fd(req, fi_in);
+	out_fd = lo_fi_fd(req, fi_out);
 
-	res = copy_file_range(fi_in->fh, &off_in, fi_out->fh, &off_out, len,
-			      flags);
+	if (lo_debug(req))
+		fprintf(stderr, "lo_copy_file_range(ino=%" PRIu64 "/fd=%d, "
+				"off=%lu, ino=%" PRIu64 "/fd=%d, "
+				"off=%lu, size=%zd, flags=0x%x)\n",
+			ino_in, in_fd, off_in, ino_out, out_fd, off_out, len,
+			flags);
+
+	res = copy_file_range(in_fd, &off_in, out_fd, &off_out, len, flags);
 	if (res < 0)
 		fuse_reply_err(req, -errno);
 	else
@@ -1451,6 +1520,7 @@ int main(int argc, char *argv[])
 	root_elem->inode = &lo.root;
 
 	lo_map_init(&lo.dirp_map);
+	lo_map_init(&lo.fd_map);
 
 	if (fuse_parse_cmdline(&args, &opts) != 0)
 		return 1;
@@ -1542,6 +1612,7 @@ err_out1:
 	free(opts.mountpoint);
 	fuse_opt_free_args(&args);
 
+	lo_map_destroy(&lo.fd_map);
 	lo_map_destroy(&lo.dirp_map);
 	lo_map_destroy(&lo.ino_map);
 
